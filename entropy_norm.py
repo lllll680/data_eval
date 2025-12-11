@@ -8,10 +8,6 @@ from tqdm import tqdm
 def calculate_entropy_metrics(counter):
     """
     计算香农熵及其归一化值
-    Returns:
-        raw_entropy: 原始香农熵 (bits)
-        normalized_entropy: 归一化熵 (0~1), 便于跨数据集比较
-        unique_count: 类别总数 (N)
     """
     total_count = sum(counter.values())
     unique_count = len(counter)
@@ -30,13 +26,12 @@ def calculate_entropy_metrics(counter):
     max_entropy = math.log2(unique_count)
     
     # 4. 计算归一化熵 (Efficiency) = H(X) / H_max
-    # 范围 [0, 1]
     normalized_entropy = raw_entropy / max_entropy if max_entropy > 0 else 0.0
     
     return raw_entropy, normalized_entropy, unique_count
 
 def get_diversity_level(norm_entropy):
-    """根据归一化熵给出简单的阈值评价 (仅供参考)"""
+    """根据归一化熵给出简单的阈值评价"""
     if norm_entropy < 0.3:
         return "低 (Low) - 模式非常固定/单一"
     elif norm_entropy < 0.7:
@@ -44,17 +39,37 @@ def get_diversity_level(norm_entropy):
     else:
         return "高 (High) - 分布非常均匀/发散 (或过于杂乱)"
 
-def analyze_tool_usage(root_path):
+def analyze_tool_usage(root_paths):
     individual_tool_counter = Counter() 
     tool_chain_counter = Counter()      
     
-    search_pattern = os.path.join(root_path, "**", "*.json")
-    json_files = glob.glob(search_pattern, recursive=True)
-    
-    print(f"找到 {len(json_files)} 个JSON文件，开始处理...")
+    all_json_files = []
+
+    # --- 1. 聚合多个文件夹下的文件 ---
+    print(f"正在扫描 {len(root_paths)} 个数据目录...")
+    for path in root_paths:
+        if not os.path.exists(path):
+            print(f"⚠️ 警告: 路径不存在，已跳过 -> {path}")
+            continue
+            
+        search_pattern = os.path.join(path, "**", "*.json")
+        # 递归查找该目录下的所有json
+        files = glob.glob(search_pattern, recursive=True)
+        print(f"  - 目录 {path}: 发现 {len(files)} 个文件")
+        all_json_files.extend(files)
+
+    print(f"总计找到 {len(all_json_files)} 个JSON文件，开始处理...")
     valid_files_count = 0
 
-    for file_path in tqdm(json_files, desc="Processing files"):
+    # --- 2. 遍历处理 ---
+    for file_path in tqdm(all_json_files, desc="Processing files"):
+        
+        # === 修改点：跳过名为 batch_summary.json 的文件 ===
+        file_name = os.path.basename(file_path)
+        if file_name == "batch_summary.json":
+            continue
+        # ===============================================
+
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -77,21 +92,22 @@ def analyze_tool_usage(root_path):
                 valid_files_count += 1
                 
         except Exception as e:
-            # print(f"Error reading {file_path}: {e}") # 报错太多时可注释掉
+            # print(f"Error reading {file_path}: {e}") 
             continue
 
-    # --- 计算指标 ---
+    # --- 3. 计算指标 ---
     
-    # 1. 单个工具分布
+    # 指标 A: 单个工具分布
     t_raw, t_norm, t_unique = calculate_entropy_metrics(individual_tool_counter)
     
-    # 2. 工具链组合分布 (核心)
+    # 指标 B: 工具链组合分布 (核心)
     c_raw, c_norm, c_unique = calculate_entropy_metrics(tool_chain_counter)
 
-    # --- 输出报告 ---
+    # --- 4. 输出报告 ---
     print("\n" + "="*60)
-    print("📊 数据集工具多样性分析报告 (Normalized Analysis)")
+    print("📊 多数据集工具多样性分析报告 (Normalized Analysis)")
     print("="*60)
+    print(f"包含目录数: {len(root_paths)}")
     print(f"有效轨迹数 (Valid Trajectories): {valid_files_count}")
     print("-" * 60)
     
@@ -116,15 +132,21 @@ def analyze_tool_usage(root_path):
     
     print("\nTop 5 最常用的工具组合 (及其占比):")
     total_chains = sum(tool_chain_counter.values())
-    for chain, count in tool_chain_counter.most_common(5):
-        ratio = (count / total_chains) * 100
-        print(f"  {ratio:5.1f}% | [{chain}]")
+    if total_chains > 0:
+        for chain, count in tool_chain_counter.most_common(5):
+            ratio = (count / total_chains) * 100
+            print(f"  {ratio:5.1f}% | [{chain}]")
+    else:
+        print("  (无数据)")
     print("="*60)
 
 if __name__ == "__main__":
-    DATA_PATH = "/data2/ly/dataset_eval/code_apply/"
+    # 配置你的文件夹列表
+    DATA_PATHS = [
+        "/data2/ly/dataset_eval/code_apply/",
+        "/data2/ly/dataset_eval/code_apply_2/",
+        "/data2/ly/dataset_eval/code_apply_3/",
+        # 你可以继续添加更多路径...
+    ]
     
-    if os.path.exists(DATA_PATH):
-        analyze_tool_usage(DATA_PATH)
-    else:
-        print(f"路径不存在: {DATA_PATH}")
+    analyze_tool_usage(DATA_PATHS)
