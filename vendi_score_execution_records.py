@@ -50,21 +50,38 @@ def load_data(json_files: List[str]) -> List[Dict]:
 # ------------------------------------------------------------------------
 # 3. 特征提取（工具多样性）
 # ------------------------------------------------------------------------
-def stringify_request(req: Dict) -> str:
+def stringify_request(req: Dict, include_values: bool = False, max_value_length: int = 50) -> str:
     """
-    将 tool_request 转为简短字符串，主要保留键，避免数值干扰多样性。
-    如果需要更细粒度，可以在此展开值。
+    将 tool_request 转为字符串。
+    
+    Args:
+        req: tool_request 字典
+        include_values: 是否包含参数值（不仅仅是 keys）
+        max_value_length: 参数值的最大长度（避免过长）
     """
     if not isinstance(req, dict):
         return str(req)
     keys = sorted(req.keys())
+    if include_values:
+        # 包含值，但限制长度避免过长
+        parts = []
+        for k in keys:
+            v = str(req[k])
+            if len(v) > max_value_length:
+                v = v[:max_value_length] + "..."
+            parts.append(f"{k}:{v}")
+        return f"params:{','.join(parts)}"
     return f"params:{keys}"
 
 
-def extract_tool_usage(dataset: List[Dict]) -> List[str]:
+def extract_tool_usage(dataset: List[Dict], include_values: bool = False) -> List[str]:
     """
     从 execution_records 中提取工具调用字符串："tool_name(params:[...])"
     一个数据条目 -> 组合所有步骤，用 " -> " 连接
+    
+    Args:
+        dataset: 数据列表
+        include_values: 是否在 tool_request 中包含实际值（不仅仅是 keys）
     """
     tools_usage = []
     for item in dataset:
@@ -72,7 +89,7 @@ def extract_tool_usage(dataset: List[Dict]) -> List[str]:
         tool_strs = []
         for rec in records:
             tool_name = rec.get("tool_name", "") or "unknown_tool"
-            request = stringify_request(rec.get("tool_request", {}))
+            request = stringify_request(rec.get("tool_request", {}), include_values=include_values)
             tool_strs.append(f"{tool_name}({request})")
         tools_usage.append(" -> ".join(tool_strs))
     return tools_usage
@@ -144,6 +161,11 @@ def parse_args():
         default=8,
         help="嵌入计算的 batch size。",
     )
+    parser.add_argument(
+        "--include-values",
+        action="store_true",
+        help="是否在 tool_request 中包含实际值（不仅仅是 keys）。这可以提高多样性，但可能增加噪声。",
+    )
     return parser.parse_args()
 
 
@@ -165,8 +187,15 @@ def main():
 
     # 2. 提取工具多样性文本
     print("Extracting tool usage strings from execution_records...")
-    tools_usage = extract_tool_usage(dataset)
-    print(f"[Sample Tool Usage]: {tools_usage[0][:120]}..." if tools_usage else "No tool usage found.")
+    tools_usage = extract_tool_usage(dataset, include_values=args.include_values)
+    
+    # 显示样例
+    if tools_usage:
+        print(f"\n[Sample Tool Usage (first 3)]:")
+        for i, text in enumerate(tools_usage[:3]):
+            print(f"  [{i+1}] {text[:120]}...")
+    else:
+        print("No tool usage found.")
 
     # 3. 加载模型
     try:
@@ -194,4 +223,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
