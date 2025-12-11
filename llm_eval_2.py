@@ -7,15 +7,16 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # ================= 配置区域 =================
-# 你的数据文件夹列表
 DATA_DIRS = [
     "/data2/ly/dataset_eval/code_apply/", 
-    # "/data2/ly/dataset_eval/code_apply_2/"
+    "/data2/ly/dataset_eval/code_apply_2/",
+    # "/data2/ly/dataset_eval/code_apply_3/"
 ]
-# 结果保存文件名
-OUTPUT_FILE = "evaluation_summary_report.json"
+
 MODEL_PATH = "/data2/Qwen/Qwen2.5-72B-Instruct"
 
+# 输出文件的名称（将保存在每个对应的 data_dir 下）
+OUTPUT_FILENAME = "evaluation_report.json"
 # ===========================================
 
 class QwenJudge:
@@ -43,10 +44,9 @@ class QwenJudge:
             generated_ids = self.model.generate(
                 **model_inputs,
                 max_new_tokens=1024,
-                temperature=0.1, # 保持低温以获得稳定的JSON
+                temperature=0.1, 
                 top_p=0.9
             )
-            # 裁剪掉输入的prompt部分
             generated_ids = [
                 output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
             ]
@@ -55,16 +55,13 @@ class QwenJudge:
         return self._parse_json(response)
 
     def _parse_json(self, response):
-        """解析大模型返回的JSON，处理可能的格式杂质"""
         try:
-            # 尝试找到第一个 { 和最后一个 }
             start = response.find('{')
             end = response.rfind('}') + 1
             if start != -1 and end != -1:
                 json_str = response[start:end]
                 return json.loads(json_str)
             else:
-                # 尝试解析列表（针对多样性评估）
                 start_list = response.find('[')
                 end_list = response.rfind(']') + 1
                 if start_list != -1 and end_list != -1:
@@ -75,20 +72,17 @@ class QwenJudge:
         return {}
 
     def evaluate_single_trajectory(self, data):
-        """
-        维度 1, 2, 3: 针对单条数据的个体评估
-        """
+        """维度 1, 2, 3: 针对单条数据的个体评估"""
         question = data.get("question", "")
         records = data.get("execution_records", [])
         
-        # 构建轨迹文本
         trajectory_text = ""
         for step in records:
             step_num = step.get("step", "?")
             tool = step.get("tool_name", "Unknown")
             reasoning = step.get("reasoning", "")
             req = json.dumps(step.get("tool_request", {}), ensure_ascii=False)
-            res = str(step.get("tool_response", ""))[:300] # 截断过长输出
+            res = str(step.get("tool_response", ""))[:300] 
             
             trajectory_text += f"Step {step_num}:\n"
             trajectory_text += f"  Reasoning: {reasoning}\n"
@@ -123,14 +117,10 @@ Return a strictly valid JSON object:
         return self._call_model(prompt)
 
     def evaluate_diversity_batch(self, batch_summaries):
-        """
-        维度 4: 多样性/重复性评估 (Batch Level)
-        一次性输入这一批数据的信息，让模型找出相似组。
-        """
+        """维度 4: 多样性/重复性评估 (Batch Level)"""
         if not batch_summaries:
             return {}
 
-        # 构建简化的输入列表，节省token
         input_list_str = json.dumps(batch_summaries, indent=2, ensure_ascii=False)
 
         prompt = f"""
@@ -159,94 +149,102 @@ If no similarities are found, return empty {{}}.
         return self._call_model(prompt)
 
 def process_evaluation():
-    # 1. 准备工作
+    # 1. 加载模型 (只需加载一次)
     judge = QwenJudge(MODEL_PATH)
-    all_results = {} # 存储最终结果
     
+    # 2. 遍历每个目录，独立处理
     for data_dir in DATA_DIRS:
-        if not os.path.exists(data_dir): continue
+        if not os.path.exists(data_dir):
+            print(f"跳过不存在的路径: {data_dir}")
+            continue
         
-        json_files = glob.glob(os.path.join(data_dir, "*.json"))
-        print(f"\n处理目录: {data_dir} (共 {len(json_files)} 文件)")
+        # 获取该目录下的所有 json 文件
+        # 注意：排除掉我们要生成的报告文件本身，防止重复读取
+        all_files = glob.glob(os.path.join(data_dir, "*.json"))
+        json_files = [f for f in all_files if OUTPUT_FILENAME not in f]
         
-        dir_summaries = [] # 用于多样性评估的摘要列表
-        dir_file_map = {}  # 映射 run_id -> file_content
+        print(f"\n" + "="*50)
+        print(f"处理目录: {data_dir}")
+        print(f"发现文件: {len(json_files)} 个")
+        print("="*50)
         
+        # === 核心修改点：变量初始化移到循环内部 ===
+        dir_results = {}   # 当前目录的评估结果
+        dir_summaries = [] # 当前目录的多样性摘要
+        # ======================================
+
         # === 阶段 1: 逐个文件进行个体打分 ===
-        for file_path in tqdm(json_files, desc="Individual Eval"):
+        for file_path in tqdm(json_files, desc=f"Eval {os.path.basename(data_dir)}"):
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 
-                # 获取或生成 run_id
                 run_id = data.get("run_id")
                 if not run_id:
                     run_id = os.path.basename(file_path).replace(".json", "")
                 
-                # 1. 调用大模型进行三维打分
+                # 1.1 个体评估
                 eval_res = judge.evaluate_single_trajectory(data)
                 
-                # 2. 准备多样性评估的数据摘要
-                # 提取工具链字符串，例如 "Search->Calc"
+                # 1.2 收集摘要
                 tool_chain = [r.get("tool_name", "") for r in data.get("execution_records", [])]
                 tool_chain_str = "->".join(filter(None, tool_chain))
                 
                 summary_item = {
                     "run_id": run_id,
-                    "question": data.get("question", "")[:100], # 截断问题避免过长
+                    "question": data.get("question", "")[:100],
                     "tool_path": tool_chain_str
                 }
                 dir_summaries.append(summary_item)
                 
-                # 3. 暂存结果
-                all_results[run_id] = {
+                # 1.3 存入当前目录结果集
+                dir_results[run_id] = {
                     "file_path": file_path,
                     "individual_scores": eval_res.get("scores", {"logical_coherence": 0, "tool_usage_validity": 0, "goal_efficiency": 0}),
                     "eval_reason": eval_res.get("reason", ""),
-                    "similar_run_ids": [] # 稍后填充
+                    "similar_run_ids": [] 
                 }
                 
             except Exception as e:
                 print(f"Error processing {file_path}: {e}")
 
-        # === 阶段 2: 批量进行多样性/重复性评估 ===
+        # === 阶段 2: 批量进行多样性评估 ===
         if dir_summaries:
-            print(f"正在分析 {len(dir_summaries)} 条数据的路径多样性...")
+            print(f"正在分析 {data_dir} 的路径多样性...")
             similarity_groups = judge.evaluate_diversity_batch(dir_summaries)
             
-            # 解析结果并回填到 all_results
-            # similarity_groups 类似: {"g1": ["id1", "id2"], "g2": ["id3", "id4", "id5"]}
             if similarity_groups:
                 for group_name, ids in similarity_groups.items():
                     if isinstance(ids, list) and len(ids) > 1:
                         for r_id in ids:
-                            if r_id in all_results:
-                                # 将同组的其他ID加入列表 (排除自己)
+                            if r_id in dir_results:
                                 others = [x for x in ids if x != r_id]
-                                all_results[r_id]["similar_run_ids"] = others
-            else:
-                print("未发现明显的重复路径。")
+                                dir_results[r_id]["similar_run_ids"] = others
 
-    # === 阶段 3: 保存汇总报告 ===
-    output_path = os.path.join(os.getcwd(), OUTPUT_FILE)
-    
-    # 计算整体统计信息
-    total_runs = len(all_results)
-    avg_logic = np.mean([r["individual_scores"].get("logical_coherence", 0) for r in all_results.values()]) if total_runs else 0
-    
-    final_output = {
-        "meta_summary": {
-            "total_count": total_runs,
-            "avg_logical_coherence": round(avg_logic, 2),
-            "note": "similar_run_ids populated by batch LLM comparison."
-        },
-        "details": all_results
-    }
-    
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(final_output, f, indent=4, ensure_ascii=False)
+        # === 阶段 3: 计算统计并保存 ===
+        # 这里的统计仅针对当前目录
+        total_runs = len(dir_results)
+        if total_runs > 0:
+            avg_logic = np.mean([r["individual_scores"].get("logical_coherence", 0) for r in dir_results.values()])
+        else:
+            avg_logic = 0
         
-    print(f"\n✅ 评估完成！结果已保存至: {output_path}")
+        final_output = {
+            "meta_summary": {
+                "dataset_path": data_dir,
+                "total_count": total_runs,
+                "avg_logical_coherence": round(avg_logic, 2),
+            },
+            "details": dir_results
+        }
+        
+        # 拼接输出路径：直接保存在当前处理的文件夹下
+        output_path = os.path.join(data_dir, OUTPUT_FILENAME)
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(final_output, f, indent=4, ensure_ascii=False)
+            
+        print(f"✅ 目录评估完成！结果已保存至: {output_path}")
 
 if __name__ == "__main__":
     process_evaluation()
