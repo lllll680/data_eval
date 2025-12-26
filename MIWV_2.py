@@ -40,7 +40,7 @@ class DataSample:
 
     def _serialize(self):
         """
-        将 JSON 结构序列化为文本，兼容处理 dict 和 str 类型的 args/observation
+        将 JSON 结构序列化为文本，万能兼容处理各种 args/observation 格式
         """
         # 1. 构建 Prompt 部分
         prompt_text = f"User: {self.query}\n\nAssistant:\n"
@@ -51,7 +51,6 @@ class DataSample:
 
         # 2. 构建 Response 部分
         if not isinstance(self.raw_response, list):
-            # 如果 response 不是列表，尝试转为 str 直接处理（防御性编程）
             self.full_text += str(self.raw_response)
             return
 
@@ -59,7 +58,6 @@ class DataSample:
             if not isinstance(step_item, dict):
                 continue
             
-            # 这里的 key 可能是 "step1", "step2" 等
             keys = list(step_item.keys())
             if not keys:
                 continue
@@ -71,7 +69,6 @@ class DataSample:
 
             # --- Cot ---
             cot_content = content.get('cot', '')
-            # 兼容 Cot 是列表的情况
             if isinstance(cot_content, list):
                 cot_content = " ".join([str(c) for c in cot_content])
             
@@ -90,11 +87,9 @@ class DataSample:
                         action_name = action_obj.get('name', 'unknown')
                         raw_args = action_obj.get('args', {})
                         
-                        # === 修改点1：兼容 args 是字符串或字典 ===
                         if isinstance(raw_args, dict):
                             args_str = ", ".join([f'{k}="{v}"' for k,v in raw_args.items()])
                         else:
-                            # 如果 args 是字符串，直接用
                             args_str = str(raw_args)
                             
                         action_text = f"Step {step_idx+1} Action: {action_name}({args_str})\n"
@@ -103,23 +98,33 @@ class DataSample:
                         
                     self.full_text += action_text
 
-                    # --- Observation ---
-                    obs_data = coa.get('observation', [])
+                    # --- Observation (重点修改区域) ---
+                    obs_raw = coa.get('observation', [])
                     
-                    # === 修改点2：兼容 observation 格式 ===
-                    # 确保它是列表
-                    if not isinstance(obs_data, list):
-                        obs_data = [obs_data]
+                    # 1. 统一标准化为列表 list
+                    obs_items = []
+                    if isinstance(obs_raw, list):
+                        obs_items = obs_raw
+                    elif isinstance(obs_raw, dict):
+                        # 如果是单个字典，把它放进列表里
+                        obs_items = [obs_raw]
+                    else:
+                        # 字符串或其他类型
+                        obs_items = [obs_raw]
                     
                     obs_str_parts = []
-                    for obs_item in obs_data:
-                        if isinstance(obs_item, dict):
-                            # 原来的逻辑：拼接 key: value
-                            item_str = ", ".join([f"{k}: {v}" for k,v in obs_item.items()])
+                    for item in obs_items:
+                        # 2. 针对列表中的每一项进行类型判断
+                        if isinstance(item, dict):
+                            # 是字典：格式化 key: value
+                            kv_strs = []
+                            for k, v in item.items():
+                                # v 可能是列表(如[]), 字符串, 数字，直接 str(v) 即可兼容
+                                kv_strs.append(f"{k}: {v}")
+                            obs_str_parts.append("- " + ", ".join(kv_strs))
                         else:
-                            # 如果是字符串，直接添加
-                            item_str = str(obs_item)
-                        obs_str_parts.append(f"- {item_str}")
+                            # 不是字典（可能是字符串）：直接转字符串
+                            obs_str_parts.append(f"- {item}")
                     
                     if obs_str_parts:
                         full_obs_str = "Step {} Observation:\n{}\n".format(step_idx+1, "\n".join(obs_str_parts))
@@ -149,13 +154,11 @@ class MIWVCalculator:
                 try:
                     with open(f, 'r', encoding='utf-8') as fr:
                         data = json.load(fr)
-                        # 检查必要字段是否存在，不存在则报错跳过
                         if 'query' not in data or 'response' not in data:
-                            print(f"Skipping {f}: Missing query or response field")
+                            # 静默跳过或者打印简单的跳过信息，防止刷屏
                             continue
                         samples.append(DataSample(f, data))
                 except Exception as e:
-                    # 打印具体的错误文件和错误信息，方便排查
                     print(f"Error loading {f}: {e}")
         
         print(f">>> Loaded {len(samples)} samples.")
