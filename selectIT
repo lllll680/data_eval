@@ -1,0 +1,297 @@
+import os
+import json
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Tuple
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer
+
+# =================配置区域=================
+# 模型路径
+MODEL_PATH = "/raid/data/models/Qwen2.5-7B-Instruct"  # 请修改为你的实际路径
+
+# 数据文件夹列表
+DATA_DIRS = [
+    "/raid/data/ly/data/dataset/data",
+#     "/raid/data/ly/data2",
+#     "/raid/data/ly/data3"
+]
+
+# 忽略的文件名
+IGNORE_FILES = {"question_info.json", "batch_summary.json"}
+
+# SelectIT 超参数
+K_PROMPTS = 3      # 使用3个不同的Prompt
+ALPHA = 0.2        # Sentence-R的不确定性惩罚系数
+TENSOR_PARALLEL_SIZE = 1 # 使用4张A100
+
+# 输出结果保存路径
+OUTPUT_FILE = "/raid/data/ly/data/dataset/data_eval/selectit_scores.csv"
+
+# ================= 1. 数据处理模块 =================
+
+def flatten_json_to_text(data: Dict) -> str:
+    """
+    将嵌套的JSON故障数据转换为扁平化的对话文本
+    """
+    query = data.get("query", "")
+    response_list = data.get("response", [])
+    
+    # 构建 Header
+    formatted_text = f"User: {query}\nAssistant:\n"
+    
+    # 遍历每一个 Step
+    for idx, step_item in enumerate(response_list):
+        # step_item 结构可能是 {"step1": {...}}
+        step_key = list(step_item.keys())[0]
+        step_content = step_item[step_key]
+        
+        cot = step_content.get("cot", "")
+        formatted_text += f"Step {idx + 1} Cot: {cot}\n"
+        
+        # 遍历 COA (Action 和 Observation)
+        coa_list = step_content.get("coa", [])
+        for action_obs_pair in coa_list:
+            action = action_obs_pair.get("action", {})
+            observation = action_obs_pair.get("observation", "")
+            
+            # 格式化 Action
+            action_name = action.get("name", "unknown_action")
+            action_args = action.get("args", {})
+            action_str = f"{action_name}({json.dumps(action_args, ensure_ascii=False)})"
+            
+            # 格式化 Observation (如果是字典或列表，转字符串)
+            if isinstance(observation, (dict, list)):
+                obs_str = json.dumps(observation, ensure_ascii=False)
+            else:
+                obs_str = str(observation)
+                
+            formatted_text += f"Step {idx + 1} Action: {action_str}\n"
+            formatted_text += f"Step {idx + 1} Observation: {obs_str}\n"
+            
+    return formatted_text
+
+def load_data_files(dirs: List[str]) -> List[Dict]:
+    """
+    遍历目录加载数据
+    """
+    all_data = []
+    print(f"正在扫描目录: {dirs} ...")
+    
+    for d in dirs:
+        for root, _, files in os.walk(d):
+            for file in files:
+                if file in IGNORE_FILES:
+                    continue
+                if not file.endswith(".json"):
+                    continue
+                
+                file_path = os.path.join(root, file)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = json.load(f)
+                        # 转换格式
+                        flat_text = flatten_json_to_text(content)
+                        all_data.append({
+                            "file_path": file_path,
+                            "original_json": content, # 可选，如果显存不够可注释掉
+                            "flat_text": flat_text
+                        })
+                except Exception as e:
+                    print(f"Error reading {file_path}: {e}")
+    
+    print(f"共加载 {len(all_data)} 条数据。")
+    return all_data
+
+# ================= 2. Prompt 构建模块 (Sentence-R) =================
+
+def get_grading_prompts(context_text: str) -> List[str]:
+    """
+    生成K个不同的评分Prompt，用于Sentence-R
+    """
+    # 模板 1：逻辑性
+    prompt_1 = f"""请作为一名AIOps专家，评估以下故障排查过程的逻辑性和有效性。
+数据内容：
+{context_text}
+
+请根据排查步骤是否清晰、操作是否正确、观察结果利用是否合理进行打分（1到5分）。
+5分：逻辑完美，操作精准。
+1分：逻辑混乱，操作错误。
+请仅输出一个数字（1, 2, 3, 4, 5）。
+评分："""
+
+    # 模板 2：指令遵循
+    prompt_2 = f"""请检查以下对话中助手是否正确遵循了用户的排查请求。
+数据内容：
+{context_text}
+
+请对回复质量打分，范围从1（非常差）到5（非常好）。
+请仅输出一个数字作为评分。
+Score:"""
+
+    # 模板 3：观察与推理一致性
+    prompt_3 = f"""给定以下运维场景，评估'Action'和'Observation'以及'CoT'之间的衔接是否自然。
+数据内容：
+{context_text}
+
+如果模型出现幻觉或忽略观察结果，请给低分。
+请给出1-5的整数评分。
+评分："""
+
+    return [prompt_1, prompt_2, prompt_3]
+
+# ================= 3. SelectIT 核心计算模块 =================
+
+class SelectITScorer:
+    def __init__(self, model_path, tp_size):
+        print("正在初始化 vLLM 引擎...")
+        self.llm = LLM(
+            model=model_path,
+            tensor_parallel_size=tp_size,
+            trust_remote_code=True,
+            gpu_memory_utilization=0.9
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        # 获取 1-5 分对应的 Token ID
+        # 注意：不同 Tokenizer 对数字的处理不同，有的可能是 "1" 有的可能是 " 1"
+        # 这里做一个简单的映射尝试，针对 Qwen2.5
+        self.score_tokens = {}
+        for i in range(1, 6):
+            # 尝试编码 "1" 和 " 1"，取 ID
+            token_str = str(i)
+            # 这是一个简化的获取ID方法，实际中建议打印确认
+            ids = self.tokenizer.encode(token_str, add_special_tokens=False)
+            if ids:
+                self.score_tokens[i] = ids[-1] # 取最后一个token id
+        
+        print(f"Score Token Mapping: {self.score_tokens}")
+        
+    def calculate_token_r(self, logprobs_dict) -> float:
+        """
+        计算 Token-level Self-Reflection 分数
+        论文公式 Eq.3
+        """
+        # 提取 1-5 分的 logprobs
+        probs = {}
+        valid_ids = self.score_tokens.values()
+        
+        # 将 logprob 转为 prob (e^x)
+        total_prob = 0
+        score_probs = {} # key: score (1-5), value: normalized probability
+        
+        for score, token_id in self.score_tokens.items():
+            if token_id in logprobs_dict:
+                p = np.exp(logprobs_dict[token_id].logprob)
+                score_probs[score] = p
+                total_prob += p
+            else:
+                score_probs[score] = 1e-10 # 防止为0
+                total_prob += 1e-10
+
+        # 归一化 (让这5个分数的概率和为1)
+        for s in score_probs:
+            score_probs[s] /= total_prob
+            
+        # 找到基础分 S_base (概率最高的那个分)
+        s_base = max(score_probs, key=score_probs.get)
+        p_base = score_probs[s_base]
+        
+        # 计算 Token-R 分数
+        # 公式: S_base * (1 / (K-1) * sum( |P_i - P_base| ))
+        # 这里的解释是：如果 P_base 远大于其他 P_i，说明置信度高，括号内数值大
+        uncertainty_sum = 0
+        k_dim = len(score_probs) # 5
+        
+        for s, p_val in score_probs.items():
+            uncertainty_sum += abs(p_val - p_base)
+            
+        # 论文 Eq.3 的变体实现 (Disparity term)
+        disparity = (1 / (k_dim - 1)) * uncertainty_sum
+        token_r_score = s_base * disparity
+        
+        return token_r_score
+
+    def run_scoring(self, data_list: List[Dict]):
+        # 1. 准备所有的 Prompts
+        # 为了批处理，我们将所有数据的所有 Prompt 展平到一个大列表
+        all_prompts = []
+        map_idx = [] # 记录 prompt 属于哪条数据
+        
+        for idx, item in enumerate(data_list):
+            prompts = get_grading_prompts(item['flat_text'])
+            # 对 Qwen 来说，最好套上 Chat Template，但这里我们直接用续写模式（Completion）
+            # 因为我们的 Prompt 结尾是 "评分："，适合让 Base/Instruct 模型直接续写数字
+            for p in prompts:
+                all_prompts.append(p)
+                map_idx.append(idx)
+
+        # 2. vLLM 推理
+        print(f"开始推理，共 {len(all_prompts)} 个请求...")
+        sampling_params = SamplingParams(
+            temperature=0,      # 贪婪采样，我们需要确定的概率
+            max_tokens=1,       # 只需要生成一个数字
+            logprobs=20         #以此获取 Top-20 的 token 概率，确保能覆盖 1-5
+        )
+        
+        outputs = self.llm.generate(all_prompts, sampling_params)
+        
+        # 3. 收集结果
+        # temp_scores[data_idx] = [score_prompt1, score_prompt2, score_prompt3]
+        temp_scores = {i: [] for i in range(len(data_list))}
+        
+        for i, output in enumerate(outputs):
+            data_idx = map_idx[i]
+            # 获取第一个生成 Token 的 logprobs
+            # output.outputs[0].logprobs[0] 是一个字典 {token_id: Logprob}
+            logprobs = output.outputs[0].logprobs[0]
+            
+            # 计算这一条 Prompt 的 Token-R 分数
+            token_r = self.calculate_token_r(logprobs)
+            temp_scores[data_idx].append(token_r)
+            
+        # 4. 计算 Sentence-R (最终分数)
+        results = []
+        for i, item in enumerate(data_list):
+            scores = temp_scores[i]
+            avg_score = np.mean(scores)
+            std_score = np.std(scores)
+            
+            # 论文 Eq.4: Mean / (1 + alpha * Std)
+            final_score = avg_score / (1 + ALPHA * std_score)
+            
+            results.append({
+                "file_path": item["file_path"],
+                "query": item["original_json"].get("query", ""), # 方便查看
+                "raw_scores": scores, # 各个Prompt的Token-R得分
+                "mean_score": avg_score,
+                "std_score": std_score,
+                "selectit_score": final_score
+            })
+            
+        return results
+
+# ================= 主程序 =================
+
+if __name__ == "__main__":
+    # 1. 加载数据
+    data_items = load_data_files(DATA_DIRS)
+    
+    if not data_items:
+        print("未找到数据，程序退出。")
+        exit()
+
+    # 2. 初始化打分器
+    scorer = SelectITScorer(MODEL_PATH, TENSOR_PARALLEL_SIZE)
+    
+    # 3. 运行计算
+    result_list = scorer.run_scoring(data_items)
+    
+    # 4. 保存结果
+    df = pd.DataFrame(result_list)
+    # 按分数降序排列
+    df = df.sort_values(by="selectit_score", ascending=False)
+    
+    df.to_csv(OUTPUT_FILE, index=False)
+    print(f"计算完成！结果已保存至 {OUTPUT_FILE}")
+    print(f"Top 5 数据示例:\n{df.head(5)}")
