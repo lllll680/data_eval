@@ -41,7 +41,9 @@ def get_diversity_level(norm_entropy):
 
 def analyze_tool_usage(root_paths):
     individual_tool_counter = Counter() 
-    tool_chain_counter = Counter()      
+    tool_chain_counter = Counter()
+    # 记录每个工具链组合对应的文件路径列表
+    tool_chain_files = {}
     
     all_json_files = []
 
@@ -109,6 +111,10 @@ def analyze_tool_usage(root_paths):
             if current_chain:
                 chain_signature = " -> ".join(current_chain)
                 tool_chain_counter[chain_signature] += 1
+                # 记录该文件路径到对应的工具链组合
+                if chain_signature not in tool_chain_files:
+                    tool_chain_files[chain_signature] = []
+                tool_chain_files[chain_signature].append(file_path)
                 valid_files_count += 1
                 
         except Exception as e:
@@ -150,12 +156,22 @@ def analyze_tool_usage(root_paths):
     print("   [0.7 - 1.0]: 离散度高。几乎没有固定的套路，每条数据的解决路径都不同。")
     print("="*60)
     
-    print("\nTop 5 最常用的工具组合 (及其占比):")
+    print("\n所有工具组合及其对应的文件路径:")
     total_chains = sum(tool_chain_counter.values())
     if total_chains > 0:
-        for chain, count in tool_chain_counter.most_common(5):
+        # 按使用频率排序
+        sorted_chains = tool_chain_counter.most_common()
+        for idx, (chain, count) in enumerate(sorted_chains, 1):
             ratio = (count / total_chains) * 100
-            print(f"  {ratio:5.1f}% | [{chain}]")
+            print(f"\n  [{idx}] {ratio:5.1f}% | 使用次数: {count} | [{chain}]")
+            # 输出对应的文件路径
+            file_paths = tool_chain_files.get(chain, [])
+            if file_paths:
+                print(f"      对应的文件 ({len(file_paths)} 个):")
+                for fp in file_paths:
+                    print(f"        - {fp}")
+            else:
+                print(f"      (未找到对应文件路径)")
     else:
         print("  (无数据)")
     print("="*60)
