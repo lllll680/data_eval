@@ -139,20 +139,35 @@ def levenshtein_similarity(seqs: List[str]):
 # ------------------------------------------------------------------------
 
 def load_data(paths: List[str]) -> List[Dict]:
-    # ... (使用你之前提供的 load_data 逻辑，或者简单的 glob) ...
+    """加载数据，跳过 question_info.json 和 batch_summary.json 文件"""
     json_files = []
+    skip_files = {"question_info.json", "batch_summary.json"}
+    
     for path in paths:
-        if os.path.isfile(path): json_files.append(path)
-        else: json_files.extend(glob.glob(os.path.join(path, "**/*.json"), recursive=True))
+        if os.path.isfile(path) and path.endswith(".json"):
+            file_name = os.path.basename(path)
+            if file_name not in skip_files:
+                json_files.append(os.path.abspath(path))
+        elif os.path.isdir(path):
+            # 使用 glob 递归收集
+            all_files = glob.glob(os.path.join(os.path.abspath(path), "**", "*.json"), recursive=True)
+            # 过滤掉需要跳过的文件
+            for fp in all_files:
+                file_name = os.path.basename(fp)
+                if file_name not in skip_files:
+                    json_files.append(fp)
     
     data = []
     for fp in json_files:
         try:
             with open(fp, "r", encoding="utf-8") as f:
                 content = json.load(f)
-                if isinstance(content, list): data.extend(content)
-                else: data.append(content)
-        except: pass
+                if isinstance(content, list): 
+                    data.extend(content)
+                else: 
+                    data.append(content)
+        except Exception as e:
+            print(f"[WARN] Failed to load {fp}: {e}")
     return data
 
 def main():
