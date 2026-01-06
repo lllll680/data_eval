@@ -20,6 +20,9 @@ OUTPUT_DIR = "/raid/data/ly/data/dataset/data_eval/reports"
 
 # 输出文件的基础名称（实际文件名会包含数据目录的标识）
 OUTPUT_FILENAME = "evaluation_report.json"
+
+# 需要跳过的特定文件名列表
+SKIP_FILENAMES = ["question_info.json", "batch_summary.json"]
 # ===========================================
 
 class QwenJudge:
@@ -167,19 +170,24 @@ def process_evaluation():
             continue
         
         # 获取该目录下的所有 json 文件
-        # 注意：排除掉我们要生成的报告文件本身，防止重复读取
         all_files = glob.glob(os.path.join(data_dir, "*.json"))
-        json_files = [f for f in all_files if OUTPUT_FILENAME not in f]
+        
+        # === 修改点：增加对特定文件名的过滤 ===
+        json_files = []
+        for f in all_files:
+            fname = os.path.basename(f)
+            # 排除报告文件本身，以及指定的两个跳过文件
+            if OUTPUT_FILENAME not in fname and fname not in SKIP_FILENAMES:
+                json_files.append(f)
+        # ======================================
         
         print(f"\n" + "="*50)
         print(f"处理目录: {data_dir}")
-        print(f"发现文件: {len(json_files)} 个")
+        print(f"发现文件: {len(json_files)} 个 (已跳过辅助/报告文件)")
         print("="*50)
         
-        # === 核心修改点：变量初始化移到循环内部 ===
-        dir_results = {}   # 当前目录的评估结果
-        dir_summaries = [] # 当前目录的多样性摘要
-        # ======================================
+        dir_results = {}   
+        dir_summaries = [] 
 
         # === 阶段 1: 逐个文件进行个体打分 ===
         for file_path in tqdm(json_files, desc=f"Eval {os.path.basename(data_dir)}"):
@@ -187,6 +195,10 @@ def process_evaluation():
                 with open(file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 
+                # 检查数据格式是否符合 trajectory 要求 (简单校验防止读错非轨迹文件)
+                if "execution_records" not in data:
+                    continue
+
                 run_id = data.get("run_id")
                 if not run_id:
                     run_id = os.path.basename(file_path).replace(".json", "")
@@ -230,7 +242,6 @@ def process_evaluation():
                                 dir_results[r_id]["similar_run_ids"] = others
 
         # === 阶段 3: 计算统计并保存 ===
-        # 这里的统计仅针对当前目录
         total_runs = len(dir_results)
         if total_runs > 0:
             avg_logic = np.mean([r["individual_scores"].get("logical_coherence", 0) for r in dir_results.values()])
@@ -246,8 +257,6 @@ def process_evaluation():
             "details": dir_results
         }
         
-        # === 修改：将报告保存到统一的输出目录 ===
-        # 生成唯一的文件名：使用数据目录的最后一级目录名作为标识
         dir_basename = os.path.basename(data_dir.rstrip('/\\')) or os.path.basename(os.path.dirname(data_dir.rstrip('/\\')))
         output_filename = f"{dir_basename}_{OUTPUT_FILENAME}"
         output_path = os.path.join(OUTPUT_DIR, output_filename)
