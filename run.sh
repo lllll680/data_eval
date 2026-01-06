@@ -9,3 +9,6 @@ python /data2/ly/dataset_eval/code_apply/vendi_score_execution_records.py \
       python vendi_score_execution_records.py \
        --data-roots /your/data/path \
        --include-values
+
+
+screen -L -S swift_8b -Logfile /raid/data/ly/data/agentgym_data_new/swift.log bash /raid/data/ly/data/agentgym_data_new/swift_qwen3_8b.sh
