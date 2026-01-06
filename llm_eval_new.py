@@ -15,7 +15,10 @@ DATA_DIRS = [
 
 MODEL_PATH = "/data2/Qwen/Qwen2.5-72B-Instruct"
 
-# 输出文件的名称（将保存在每个对应的 data_dir 下）
+# 输出目录：所有报告文件将保存到这个目录下
+OUTPUT_DIR = "/raid/data/ly/data/dataset/data_eval/reports"
+
+# 输出文件的基础名称（实际文件名会包含数据目录的标识）
 OUTPUT_FILENAME = "evaluation_report.json"
 # ===========================================
 
@@ -152,6 +155,11 @@ def process_evaluation():
     # 1. 加载模型 (只需加载一次)
     judge = QwenJudge(MODEL_PATH)
     
+    # 创建输出目录（如果不存在）
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        print(f"📁 创建输出目录: {OUTPUT_DIR}")
+    
     # 2. 遍历每个目录，独立处理
     for data_dir in DATA_DIRS:
         if not os.path.exists(data_dir):
@@ -238,8 +246,11 @@ def process_evaluation():
             "details": dir_results
         }
         
-        # 拼接输出路径：直接保存在当前处理的文件夹下
-        output_path = os.path.join(data_dir, OUTPUT_FILENAME)
+        # === 修改：将报告保存到统一的输出目录 ===
+        # 生成唯一的文件名：使用数据目录的最后一级目录名作为标识
+        dir_basename = os.path.basename(data_dir.rstrip('/\\')) or os.path.basename(os.path.dirname(data_dir.rstrip('/\\')))
+        output_filename = f"{dir_basename}_{OUTPUT_FILENAME}"
+        output_path = os.path.join(OUTPUT_DIR, output_filename)
         
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(final_output, f, indent=4, ensure_ascii=False)
