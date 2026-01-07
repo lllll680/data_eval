@@ -12,7 +12,6 @@ CONFIG = {
     # 数据文件夹列表
     "data_dirs": [
         "/data2/ly/dataset_eval/data",
-        # 在这里检查是否还有重复路径
     ],
     # 结果保存路径
     "output_file": "/data2/ly/dataset_eval/miwv_results.json",
@@ -37,36 +36,56 @@ class DataSample:
         self._serialize()
 
     def _serialize(self):
+        """
+        将 JSON 结构序列化为文本，并记录需要 Mask 的位置。
+        """
+        # 1. 构建 Prompt 部分
         prompt_text = f"User: {self.query}\n\nAssistant:\n"
         self.full_text += prompt_text
+        # Mask 掉 Prompt 区域
         self.mask_ranges.append((0, len(prompt_text)))
 
+        # 2. 构建 Response 部分
         for step_idx, step_item in enumerate(self.raw_response):
+            # 获取当前步的 key (如 "step1") 和内容
             key = list(step_item.keys())[0]
             content = step_item[key]
             
-            # --- Cot ---
+            # --- Cot (计算 Loss) ---
             cot_text = f"Step {step_idx+1} Cot: {content.get('cot', '')}\n"
             self.full_text += cot_text
             
             # --- CoAs ---
             if 'coa' in content:
                 for coa in content['coa']:
-                    # --- Action ---
+                    # --- Action (计算 Loss) ---
                     action_obj = coa.get('action', {})
-                    args_str = ", ".join([f'{k}="{v}"' for k,v in action_obj.get('args', {}).items()])
+                    args_dict = action_obj.get('args', {})
+                    args_str = ", ".join([f'{k}="{v}"' for k, v in args_dict.items()])
                     action_text = f"Step {step_idx+1} Action: {action_obj.get('name', 'unknown')}({args_str})\n"
                     self.full_text += action_text
 
-                    # --- Observation ---
-                    obs_list = coa.get('observation', [])
+                    # --- Observation (修复此处：适配字典或列表格式，且需要 Mask) ---
+                    obs_data = coa.get('observation', {})
                     obs_str_parts = []
-                    for obs_item in obs_list:
-                        item_str = ", ".join([f"{k}: {v}" for k,v in obs_item.items()])
+                    
+                    # 关键修复：判断 observation 的数据类型
+                    if isinstance(obs_data, dict):
+                        # 如果是字典: {"接口": "xxx", "IP": "xxx"}
+                        item_str = ", ".join([f"{k}: {v}" for k, v in obs_data.items()])
                         obs_str_parts.append(f"- {item_str}")
+                    elif isinstance(obs_data, list):
+                        # 如果是列表: [{"k1": "v1"}, {"k2": "v2"}]
+                        for obs_item in obs_data:
+                            if isinstance(obs_item, dict):
+                                item_str = ", ".join([f"{k}: {v}" for k, v in obs_item.items()])
+                                obs_str_parts.append(f"- {item_str}")
+                            else:
+                                obs_str_parts.append(f"- {obs_item}")
                     
                     full_obs_str = "Step {} Observation:\n{}\n".format(step_idx+1, "\n".join(obs_str_parts))
                     
+                    # 记录 Observation 的起止位置以便 Mask
                     start_idx = len(self.full_text)
                     self.full_text += full_obs_str
                     end_idx = len(self.full_text)
@@ -81,33 +100,25 @@ class MIWVCalculator:
     def load_data(self):
         print(">>> Loading Data...")
         samples = []
-        # 定义需要跳过的文件名
         skip_filenames = {"question_info.json", "batch_summary.json"}
-        # 用于物理路径去重，防止 CONFIG 中重复配置了文件夹
         seen_file_paths = set()
 
         for d in self.config['data_dirs']:
             if not os.path.exists(d):
                 print(f"Warning: Directory not found: {d}")
                 continue
-                
             files = glob.glob(os.path.join(d, "**/*.json"), recursive=True)
             for f in files:
-                # 1. 获取文件名进行过滤
                 basename = os.path.basename(f)
-                if basename in skip_filenames:
-                    continue
+                if basename in skip_filenames: continue
                 
-                # 2. 物理路径去重 (处理不小心写错文件夹路径的情况)
                 abs_f = os.path.abspath(f)
-                if abs_f in seen_file_paths:
-                    continue
+                if abs_f in seen_file_paths: continue
                 seen_file_paths.add(abs_f)
 
                 try:
                     with open(f, 'r', encoding='utf-8') as fr:
                         data = json.load(fr)
-                        # 简单的格式校验
                         if 'query' in data and 'response' in data:
                             samples.append(DataSample(f, data))
                 except Exception as e:
@@ -128,29 +139,25 @@ class MIWVCalculator:
 
         queries = [s.query for s in samples]
         embeddings = []
-        
         batch_size = 32
         print(">>> Computing Embeddings...")
         with torch.no_grad():
             for i in tqdm(range(0, len(queries), batch_size)):
                 batch_texts = queries[i:i+batch_size]
                 inputs = tokenizer(batch_texts, padding=True, truncation=True, max_length=512, return_tensors="pt").to(model.device)
-                
                 outputs = model(**inputs)
                 if hasattr(outputs, 'last_hidden_state'):
                     token_embeddings = outputs.last_hidden_state
-                    input_mask_expanded = inputs['attention_mask'].unsqueeze(-1).expand(token_embeddings.size()).float()
-                    batch_emb = torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                    mask = inputs['attention_mask'].unsqueeze(-1).expand(token_embeddings.size()).float()
+                    batch_emb = torch.sum(token_embeddings * mask, 1) / torch.clamp(mask.sum(1), min=1e-9)
                 else:
                     batch_emb = outputs[0]
-                
                 batch_emb = torch.nn.functional.normalize(batch_emb, p=2, dim=1)
                 embeddings.append(batch_emb.cpu().numpy())
         
         del model
         del tokenizer
         torch.cuda.empty_cache()
-        
         return np.concatenate(embeddings, axis=0)
 
     def calculate_token_loss(self, text, mask_ranges, prefix_context=""):
@@ -168,9 +175,12 @@ class MIWVCalculator:
         prefix_len = len(prefix_context)
         
         for idx, (start, end) in enumerate(offsets):
+            # 1. Mask 掉前缀(One-shot context)
             if start < prefix_len:
                 labels[0, idx] = -100
                 continue
+            
+            # 2. Mask 掉 Response 内部被标记为 Observation 或 Prompt 的部分
             rel_start = start - prefix_len
             is_masked = False
             for (m_start, m_end) in mask_ranges:
@@ -185,28 +195,28 @@ class MIWVCalculator:
         return outputs.loss.item()
 
     def run(self):
-        # 1. 加载数据
         samples = self.load_data()
-        if not samples:
-            print("No valid samples found.")
-            return
+        if not samples: return
 
-        # 2. 计算相似度并寻找邻居
+        # 1. 计算相似度并选择邻居
         embeddings = self.get_embeddings(samples)
         print(">>> Computing Similarity Matrix...")
         sim_matrix = cosine_similarity(embeddings)
         
-        # 额外保险：如果 Query 完全一致，则不互为邻居（防止同一 Query 的不同 Response 互相泄露）
+        # 排除自身，且排除 Query 完全相同的样本（防止泄露）
         for i in range(len(samples)):
             for j in range(len(samples)):
                 if i == j or samples[i].query == samples[j].query:
                     sim_matrix[i][j] = -1
-                    
         most_sim_indices = np.argmax(sim_matrix, axis=1)
 
-        # 3. 加载推理模型
+        # 2. 加载推理模型
         print(f">>> Loading LLM: {self.config['llm_model_path']} ...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.config['llm_model_path'], trust_remote_code=True)
+        # 确保 pad_token 存在
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config['llm_model_path'],
             device_map=self.config['device_map'],
@@ -214,17 +224,17 @@ class MIWVCalculator:
             trust_remote_code=True
         ).eval()
 
-        # 4. 计算 MIWV
+        # 3. 计算 MIWV
         results = []
         print(">>> Calculating MIWV Scores...")
         for i, sample in enumerate(tqdm(samples)):
             try:
+                # Loss Zero: 直接计算
                 loss_zero = self.calculate_token_loss(sample.full_text, sample.mask_ranges, prefix_context="")
                 
-                neighbor_idx = most_sim_indices[i]
-                neighbor = samples[neighbor_idx]
+                # Loss One: 以最相似样本作为上下文
+                neighbor = samples[most_sim_indices[i]]
                 one_shot_context = neighbor.full_text + "\n\n"
-                
                 loss_one = self.calculate_token_loss(sample.full_text, sample.mask_ranges, prefix_context=one_shot_context)
                 
                 miwv = loss_one - loss_zero
@@ -238,10 +248,10 @@ class MIWVCalculator:
                     "neighbor_file": neighbor.file_path
                 })
             except Exception as e:
-                print(f"Error processing sample {i}: {e}")
+                print(f"Error processing sample {i} ({sample.file_path}): {e}")
                 torch.cuda.empty_cache()
 
-        # 5. 保存结果
+        # 4. 排序并保存
         results.sort(key=lambda x: x['miwv'], reverse=True)
         with open(self.config['output_file'], 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
