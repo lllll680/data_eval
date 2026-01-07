@@ -1,0 +1,104 @@
+import os
+import json
+import glob
+import pandas as pd
+
+# ================= 配置区域 =================
+# 评估报告所在的目录（即上一个脚本的 OUTPUT_DIR）
+REPORTS_DIR = "/raid/data/ly/data/dataset/data_eval/reports"
+
+# 排除的问题关键字（Question 3, 7, 8）
+# 脚本会检查报告文件名或内容，包含这些编号的将被跳过
+EXCLUDE_QUESTIONS = ["question3", "question7", "question8"]
+
+# 定义我们要分析的三个维度
+DIMENSIONS = ["logical_coherence", "tool_usage_validity", "goal_efficiency"]
+# ===========================================
+
+def analyze_reports():
+    # 获取目录下所有的 json 评估报告
+    report_files = glob.glob(os.path.join(REPORTS_DIR, "*.json"))
+    
+    all_folder_stats = []
+
+    print(f"🔍 正在读取报告目录: {REPORTS_DIR}")
+    
+    for file_path in report_files:
+        filename = os.path.basename(file_path).lower()
+        
+        # 1. 过滤掉 Question 3, 7, 8
+        if any(q in filename for q in EXCLUDE_QUESTIONS):
+            print(f"⏭️  跳过排除的问题: {filename}")
+            continue
+            
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                report_data = json.load(f)
+            
+            details = report_data.get("details", {})
+            folder_name = report_data.get("meta_summary", {}).get("dataset_path", "Unknown")
+            folder_label = os.path.basename(folder_name.rstrip('/\\'))
+
+            # 2. 提取 run_001 到 run_030 的分数
+            scores_list = []
+            for run_id, run_data in details.items():
+                # 过滤掉 batch_summary 和 question_info (通常这些不会在 details 里，但做个保险)
+                if "run_" not in run_id:
+                    continue
+                
+                # 提取三个维度的分数
+                indiv_scores = run_data.get("individual_scores", {})
+                row = {
+                    "folder": folder_label,
+                    "run_id": run_id,
+                    "logical_coherence": indiv_scores.get("logical_coherence", 0),
+                    "tool_usage_validity": indiv_scores.get("tool_usage_validity", 0),
+                    "goal_efficiency": indiv_scores.get("goal_efficiency", 0)
+                }
+                scores_list.append(row)
+
+            if not scores_list:
+                continue
+
+            # 3. 转换为 DataFrame 进行统计
+            df_folder = pd.DataFrame(scores_list)
+            
+            # 计算当前文件夹的统计指标
+            stats = df_folder[DIMENSIONS].agg(['mean', 'std', 'min', 'max']).T
+            stats['folder'] = folder_label
+            all_folder_stats.append(stats)
+
+            # 打印当前文件夹的简要分析
+            print(f"\n📊 文件夹分析结果: {folder_label} (样本数: {len(df_folder)})")
+            print(stats[['mean', 'std', 'min', 'max']].round(2))
+
+        except Exception as e:
+            print(f"❌ 处理文件 {filename} 时出错: {e}")
+
+    # 4. 汇总所有文件夹对比
+    if all_folder_stats:
+        print("\n" + "="*60)
+        print("📈 所有有效文件夹 (除 Q3,7,8 外) 的均值对比")
+        print("="*60)
+        
+        # 整理汇总表
+        summary_rows = []
+        for s in all_folder_stats:
+            folder_name = s['folder'].iloc[0]
+            row = {"Folder": folder_name}
+            for dim in DIMENSIONS:
+                row[dim] = round(s.loc[dim, 'mean'], 2)
+            summary_rows.append(row)
+        
+        summary_df = pd.DataFrame(summary_rows)
+        print(summary_df.to_string(index=False))
+        
+        # 保存到本地 CSV
+        output_csv = os.path.join(REPORTS_DIR, "final_statistical_analysis.csv")
+        summary_df.to_csv(output_csv, index=False)
+        print(f"\n✅ 汇总报告已保存至: {output_csv}")
+    else:
+        print("⚠️ 未找到有效的评估数据进行分析。")
+
+if __name__ == "__main__":
+    analyze_reports()
