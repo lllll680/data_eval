@@ -10,18 +10,18 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 DATA_DIRS = [
     "/data2/ly/dataset_eval/code_apply/", 
     "/data2/ly/dataset_eval/code_apply_2/",
-    # "/data2/ly/dataset_eval/code_apply_3/"
 ]
 
+# 评估模型路径
 MODEL_PATH = "/data2/Qwen/Qwen2.5-72B-Instruct"
 
-# 输出目录：所有报告文件将保存到这个目录下
+# 输出报告目录
 OUTPUT_DIR = "/raid/data/ly/data/dataset/data_eval/reports"
 
-# 输出文件的基础名称（实际文件名会包含数据目录的标识）
+# 报告文件后缀名
 OUTPUT_FILENAME = "evaluation_report.json"
 
-# 需要跳过的特定文件名列表
+# 需要跳过的特定文件名
 SKIP_FILENAMES = ["question_info.json", "batch_summary.json"]
 # ===========================================
 
@@ -68,6 +68,7 @@ class QwenJudge:
                 json_str = response[start:end]
                 return json.loads(json_str)
             else:
+                # 兼容列表格式的返回
                 start_list = response.find('[')
                 end_list = response.rfind(']') + 1
                 if start_list != -1 and end_list != -1:
@@ -78,35 +79,53 @@ class QwenJudge:
         return {}
 
     def evaluate_single_trajectory(self, data):
-        """维度 1, 2, 3: 针对单条数据的个体评估"""
-        question = data.get("question", "")
-        records = data.get("execution_records", [])
+        """
+        维度 1, 2, 3: 针对单条数据的个体评估
+        适配数据格式: query + response -> stepX -> cot/coa
+        """
+        query = data.get("query", "")
+        response_steps = data.get("response", [])
         
         trajectory_text = ""
-        for step in records:
-            step_num = step.get("step", "?")
-            tool = step.get("tool_name", "Unknown")
-            reasoning = step.get("reasoning", "")
-            req = json.dumps(step.get("tool_request", {}), ensure_ascii=False)
-            res = str(step.get("tool_response", ""))[:300] 
+        # 遍历 response 中的每一个 step 字典
+        for idx, step_item in enumerate(response_steps):
+            # 获取 step1, step2 这种动态 key
+            step_key = list(step_item.keys())[0]
+            content = step_item[step_key]
             
-            trajectory_text += f"Step {step_num}:\n"
-            trajectory_text += f"  Reasoning: {reasoning}\n"
-            trajectory_text += f"  Action: {tool} -> {req}\n"
-            trajectory_text += f"  Observation: {res}...\n\n"
+            cot = content.get("cot", "")
+            trajectory_text += f"Step {idx + 1} (Analysis): {cot}\n"
+            
+            # 遍历 coa 列表
+            if 'coa' in content:
+                for coa_idx, coa in enumerate(content['coa']):
+                    action = coa.get("action", {})
+                    action_name = action.get("name", "Unknown")
+                    args = json.dumps(action.get("args", {}), ensure_ascii=False)
+                    
+                    # observation 处理
+                    obs = coa.get("observation", "")
+                    if isinstance(obs, (dict, list)):
+                        obs_str = json.dumps(obs, ensure_ascii=False)[:300]
+                    else:
+                        obs_str = str(obs)[:300]
+
+                    trajectory_text += f"  Action {coa_idx+1}: {action_name}({args})\n"
+                    trajectory_text += f"  Observation {coa_idx+1}: {obs_str}...\n"
+            trajectory_text += "-"*20 + "\n"
 
         prompt = f"""
 ### Task
 Evaluate the AI Agent's execution trajectory for the given User Question based on 3 dimensions.
 
 ### Data
-**User Question:** {question}
+**User Question:** {query}
 **Trajectory:**
 {trajectory_text}
 
 ### Dimensions & Criteria (Score 1-10)
-1. **Logical Coherence**: Does the reasoning make sense? Is the plan consistent? No hallucinations?
-2. **Tool Usage Validity**: Are the chosen tools correct for the sub-tasks? Are parameters accurate?
+1. **Logical Coherence**: Does the reasoning (CoT) make sense? Is the plan consistent? No hallucinations?
+2. **Tool Usage Validity**: Are the chosen tools (Action) correct for the sub-tasks? Are parameters accurate?
 3. **Goal Efficiency**: Did it solve the problem directly without loops or redundant steps?
 
 ### Output
@@ -123,104 +142,89 @@ Return a strictly valid JSON object:
         return self._call_model(prompt)
 
     def evaluate_diversity_batch(self, batch_summaries):
-        """维度 4: 多样性/重复性评估 (Batch Level)"""
+        """维度 4: 多样性评估 (保持原样)"""
         if not batch_summaries:
             return {}
-
         input_list_str = json.dumps(batch_summaries, indent=2, ensure_ascii=False)
-
         prompt = f"""
 ### Task
-You are a Data Diversity Analyst. I will provide a list of {len(batch_summaries)} agent execution summaries.
-Your goal is to identify **groups of runs that are semantically similar**.
-
-Two runs are "similar" if:
-1. They address the exact same or very similar question.
-2. They use the same sequence of tools to solve it (Logic path is identical).
+Identify groups of runs that are semantically similar from {len(batch_summaries)} summaries.
+Similar means: Same User Question + Same Tool Sequence.
 
 ### Input Data
 {input_list_str}
 
 ### Output
-Return a JSON object where keys are "group_1", "group_2", etc., and values are lists of `run_id`s that are similar.
-Runs that are unique should NOT be included in the output.
-
-Example Output format:
-{{
-    "similar_group_1": ["run_id_A", "run_id_B"],
-    "similar_group_2": ["run_id_X", "run_id_Y", "run_id_Z"]
-}}
-If no similarities are found, return empty {{}}.
+Return JSON: {{"similar_group_1": ["run_id_A", "run_id_B"], ...}}. If none, return {{}}.
 """
         return self._call_model(prompt)
 
 def process_evaluation():
-    # 1. 加载模型 (只需加载一次)
     judge = QwenJudge(MODEL_PATH)
     
-    # 创建输出目录（如果不存在）
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        print(f"📁 创建输出目录: {OUTPUT_DIR}")
     
-    # 2. 遍历每个目录，独立处理
     for data_dir in DATA_DIRS:
         if not os.path.exists(data_dir):
             print(f"跳过不存在的路径: {data_dir}")
             continue
         
-        # 获取该目录下的所有 json 文件
-        all_files = glob.glob(os.path.join(data_dir, "*.json"))
+        # 查找所有 JSON 文件
+        all_files = glob.glob(os.path.join(data_dir, "**/*.json"), recursive=True)
         
-        # === 修改点：增加对特定文件名的过滤 ===
         json_files = []
         for f in all_files:
             fname = os.path.basename(f)
-            # 排除报告文件本身，以及指定的两个跳过文件
-            if OUTPUT_FILENAME not in fname and fname not in SKIP_FILENAMES:
+            # 过滤跳过列表及报告文件
+            if fname not in SKIP_FILENAMES and OUTPUT_FILENAME not in fname:
                 json_files.append(f)
-        # ======================================
         
         print(f"\n" + "="*50)
         print(f"处理目录: {data_dir}")
-        print(f"发现文件: {len(json_files)} 个 (已跳过辅助/报告文件)")
+        print(f"有效样本数: {len(json_files)}")
         print("="*50)
         
         dir_results = {}   
         dir_summaries = [] 
 
-        # === 阶段 1: 逐个文件进行个体打分 ===
         for file_path in tqdm(json_files, desc=f"Eval {os.path.basename(data_dir)}"):
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 
-                # 检查数据格式是否符合 trajectory 要求 (简单校验防止读错非轨迹文件)
-                if "execution_records" not in data:
+                # 【关键点】适配新格式校验：检查是否有 query 和 response
+                if "query" not in data or "response" not in data:
                     continue
 
-                run_id = data.get("run_id")
-                if not run_id:
-                    run_id = os.path.basename(file_path).replace(".json", "")
+                # 生成 Run ID
+                run_id = data.get("run_id") or os.path.basename(file_path).replace(".json", "")
                 
                 # 1.1 个体评估
                 eval_res = judge.evaluate_single_trajectory(data)
                 
-                # 1.2 收集摘要
-                tool_chain = [r.get("tool_name", "") for r in data.get("execution_records", [])]
-                tool_chain_str = "->".join(filter(None, tool_chain))
+                # 1.2 收集路径摘要（提取所有 action name 连成串）
+                all_tools = []
+                for step_item in data.get("response", []):
+                    step_key = list(step_item.keys())[0]
+                    content = step_item[step_key]
+                    if 'coa' in content:
+                        for coa in content['coa']:
+                            all_tools.append(coa.get("action", {}).get("name", ""))
                 
                 summary_item = {
                     "run_id": run_id,
-                    "question": data.get("question", "")[:100],
-                    "tool_path": tool_chain_str
+                    "question": data.get("query", "")[:100],
+                    "tool_path": " -> ".join(filter(None, all_tools))
                 }
                 dir_summaries.append(summary_item)
                 
-                # 1.3 存入当前目录结果集
+                # 1.3 存储结果
                 dir_results[run_id] = {
                     "file_path": file_path,
-                    "individual_scores": eval_res.get("scores", {"logical_coherence": 0, "tool_usage_validity": 0, "goal_efficiency": 0}),
+                    "individual_scores": eval_res.get("scores", {
+                        "logical_coherence": 0, "tool_usage_validity": 0, "goal_efficiency": 0
+                    }),
                     "eval_reason": eval_res.get("reason", ""),
                     "similar_run_ids": [] 
                 }
@@ -228,11 +232,10 @@ def process_evaluation():
             except Exception as e:
                 print(f"Error processing {file_path}: {e}")
 
-        # === 阶段 2: 批量进行多样性评估 ===
+        # === 多样性分析 ===
         if dir_summaries:
-            print(f"正在分析 {data_dir} 的路径多样性...")
+            print(f"正在分析该目录的多样性...")
             similarity_groups = judge.evaluate_diversity_batch(dir_summaries)
-            
             if similarity_groups:
                 for group_name, ids in similarity_groups.items():
                     if isinstance(ids, list) and len(ids) > 1:
@@ -241,30 +244,32 @@ def process_evaluation():
                                 others = [x for x in ids if x != r_id]
                                 dir_results[r_id]["similar_run_ids"] = others
 
-        # === 阶段 3: 计算统计并保存 ===
+        # === 保存当前目录的结果 ===
         total_runs = len(dir_results)
         if total_runs > 0:
             avg_logic = np.mean([r["individual_scores"].get("logical_coherence", 0) for r in dir_results.values()])
+            avg_tool = np.mean([r["individual_scores"].get("tool_usage_validity", 0) for r in dir_results.values()])
         else:
-            avg_logic = 0
+            avg_logic, avg_tool = 0, 0
         
         final_output = {
             "meta_summary": {
                 "dataset_path": data_dir,
                 "total_count": total_runs,
-                "avg_logical_coherence": round(avg_logic, 2),
+                "avg_logical_coherence": round(float(avg_logic), 2),
+                "avg_tool_usage_validity": round(float(avg_tool), 2),
             },
             "details": dir_results
         }
         
-        dir_basename = os.path.basename(data_dir.rstrip('/\\')) or os.path.basename(os.path.dirname(data_dir.rstrip('/\\')))
-        output_filename = f"{dir_basename}_{OUTPUT_FILENAME}"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
+        # 生成输出文件名：目录名_evaluation_report.json
+        dir_clean_name = data_dir.strip('/').split('/')[-1]
+        output_path = os.path.join(OUTPUT_DIR, f"{dir_clean_name}_{OUTPUT_FILENAME}")
         
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(final_output, f, indent=4, ensure_ascii=False)
             
-        print(f"✅ 目录评估完成！结果已保存至: {output_path}")
+        print(f"✅ 目录 {dir_clean_name} 评估完成！Total Count: {total_runs}, 保存至: {output_path}")
 
 if __name__ == "__main__":
     process_evaluation()
