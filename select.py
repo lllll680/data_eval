@@ -5,33 +5,32 @@ import glob
 from sklearn.preprocessing import MinMaxScaler
 
 # ================= 配置区域 =================
-# 请确保这些路径指向你实际的文件
 MIWV_FILE = "/data2/ly/dataset_eval/miwv_results.json"
 IFD_FILE = "/raid/data/ly/data/dataset/ifd_results.jsonl"
 SELECTIT_FILE = "/raid/data/ly/data/dataset/data_eval/selectit_scores.csv"
-LLM_EVAL_DIR = "/raid/data/ly/data/dataset/data_eval/reports/" # 包含8个json的文件夹
-
-TOP_N = 4 # 每个文件夹选几条
+LLM_EVAL_DIR = "/raid/data/ly/data/dataset/data_eval/reports/"
+TOP_N = 4 
 # ===========================================
 
 def load_data():
-    # 1. 加载 MIWV (JSON)
+    # 1. 加载 MIWV
     with open(MIWV_FILE, 'r', encoding='utf-8') as f:
-        miwv_data = json.load(f)
-    df_miwv = pd.DataFrame(miwv_data)[['file', 'miwv']]
-    df_miwv.rename(columns={'file': 'file_path'}, inplace=True)
+        df_miwv = pd.DataFrame(json.load(f))[['file', 'miwv']]
+    df_miwv.rename(columns={'file': 'file_path', 'miwv': 'miwv_raw'}, inplace=True)
 
-    # 2. 加载 IFD (JSONL)
+    # 2. 加载 IFD
     ifd_list = []
     with open(IFD_FILE, 'r', encoding='utf-8') as f:
         for line in f:
             ifd_list.append(json.loads(line))
     df_ifd = pd.DataFrame(ifd_list)[['file_path', 'ifd_score']]
+    df_ifd.rename(columns={'ifd_score': 'ifd_raw'}, inplace=True)
 
-    # 3. 加载 SelectIT (CSV)
+    # 3. 加载 SelectIT
     df_sit = pd.read_csv(SELECTIT_FILE)[['file_path', 'selectit_score']]
+    df_sit.rename(columns={'selectit_score': 'selectit_raw'}, inplace=True)
 
-    # 4. 加载 LLM_Eval (多个JSON)
+    # 4. 加载 LLM_Eval 并提取真实的工具链
     llm_list = []
     report_files = glob.glob(os.path.join(LLM_EVAL_DIR, "*.json"))
     for rf in report_files:
@@ -39,99 +38,81 @@ def load_data():
             report = json.load(f)
             folder_name = report['meta_summary']['dataset_path'].strip('/').split('/')[-1]
             for run_id, detail in report['details'].items():
+                # --- 这里是提取真实工具链的关键步骤 ---
+                # 从文件路径重新读取原始数据来获取工具链，或者从report中获取（如果report存了）
+                # 这里假设你的 report 结构中有类似 summary_item 存的 tool_path
+                # 如果没有，我们暂且用 run_id 的前缀，建议此处根据你 report 实际有的字段调整
                 llm_list.append({
-                    'file_path': detail['file_path'],
+                    'file_path': os.path.abspath(detail['file_path']),
                     'folder': folder_name,
-                    'logic': detail['individual_scores']['logical_coherence'],
-                    'tool': detail['individual_scores']['tool_usage_validity'],
-                    'efficiency': detail['individual_scores']['goal_efficiency'],
-                    # 提取工具链用于去重
-                    'tool_chain': " -> ".join([run_id]) # 简化处理，实际可以从detail中获取更详细的path
+                    'logic_raw': detail['individual_scores']['logical_coherence'],
+                    'tool_raw': detail['individual_scores']['tool_usage_validity'],
+                    'eff_raw': detail['individual_scores']['goal_efficiency'],
+                    'tool_chain': detail.get('tool_path', run_id) # 这里的 tool_path 需要确保在 eval 代码里存了
                 })
     df_llm = pd.DataFrame(llm_list)
 
-    # 5. 合并所有 DataFrame
-    # 注意：file_path 可能需要统一为绝对路径以防对不齐
-    df_llm['file_path'] = df_llm['file_path'].apply(os.path.abspath)
+    # 5. 合并
     df_miwv['file_path'] = df_miwv['file_path'].apply(os.path.abspath)
     df_ifd['file_path'] = df_ifd['file_path'].apply(os.path.abspath)
     df_sit['file_path'] = df_sit['file_path'].apply(os.path.abspath)
 
-    df_final = df_llm.merge(df_miwv, on='file_path', how='inner')
-    df_final = df_final.merge(df_ifd, on='file_path', how='inner')
-    df_final = df_final.merge(df_sit, on='file_path', how='inner')
-    
+    df_final = df_llm.merge(df_miwv, on='file_path').merge(df_ifd, on='file_path').merge(df_sit, on='file_path')
     return df_final
 
 def rank_and_select(df):
-    # 1. 硬性过滤：逻辑和工具使用必须及格
-    df = df[(df['logic'] >= 7.0) & (df['tool'] >= 7.0)].copy()
-
-    # 2. 标准化指标 (0-1)
+    # 过滤掉逻辑不及格的样本（10分制，低于7分不要）
+    df_filtered = df[(df['logic_raw'] >= 7.0) & (df['tool_raw'] >= 7.0)].copy()
+    
+    # 准备归一化列（计算分时使用）
+    cols_to_norm = ['logic_raw', 'tool_raw', 'ifd_raw', 'miwv_raw', 'selectit_raw']
     scaler = MinMaxScaler()
-    # 注意：MIWV 越大越好（负值越接近0越好），Scaler会自动处理
-    cols_to_norm = ['logic', 'ifd_score', 'miwv', 'selectit_score']
-    df[cols_to_norm] = scaler.fit_transform(df[cols_to_norm])
+    
+    # 创建计算用的副本，以免覆盖原始数据
+    norm_values = scaler.fit_transform(df_filtered[cols_to_norm])
+    df_filtered['logic_norm'] = norm_values[:, 0]
+    df_filtered['tool_norm'] = norm_values[:, 1]
+    df_filtered['ifd_norm'] = norm_values[:, 2]
+    df_filtered['miwv_norm'] = norm_values[:, 3]
+    df_filtered['sit_norm'] = norm_values[:, 4]
 
-    # 3. 计算综合得分 (自定义权重)
-    df['final_score'] = (
-        df['logic'] * 0.40 + 
-        df['ifd_score'] * 0.25 + 
-        df['miwv'] * 0.20 + 
-        df['selectit_score'] * 0.15
+    # 综合得分：基于归一化后的值
+    df_filtered['final_score'] = (
+        df_filtered['logic_norm'] * 0.40 + 
+        df_filtered['tool_norm'] * 0.10 + 
+        df_filtered['ifd_norm'] * 0.20 + 
+        df_filtered['miwv_norm'] * 0.15 + 
+        df_filtered['sit_norm'] * 0.15
     )
 
-    # 4. 分文件夹排序并选择 Top N
-    # 我们不仅要分高，还要保证同一个文件夹下 tool_chain 尽量不重复
     selected_samples = []
-    
-    for folder, group in df.groupby('folder'):
-        # 先按得分降序排
+    for folder, group in df_filtered.groupby('folder'):
         sorted_group = group.sort_values(by='final_score', ascending=False)
         
         picked = []
-        seen_paths = set()
+        seen_chains = set()
         
+        # 优先选工具链不同的
         for _, row in sorted_group.iterrows():
-            if len(picked) >= TOP_N:
-                break
-            
-            # 简单的多样性检查：这里假设 tool_chain 是我们在 LLM_Eval 中提取的
-            # 如果你有更精确的工具链字段，请替换 'tool_chain'
-            t_path = row['tool_chain']
-            if t_path not in seen_paths:
+            if len(picked) >= TOP_N: break
+            if row['tool_chain'] not in seen_chains:
                 picked.append(row)
-                seen_paths.add(t_path)
+                seen_chains.add(row['tool_chain'])
         
-        # 如果去重后不够N条，再从未选中的里面按分数补齐
+        # 不够则按分数补齐
         if len(picked) < TOP_N:
             remaining = sorted_group[~sorted_group['file_path'].isin([p['file_path'] for p in picked])]
             for _, row in remaining.head(TOP_N - len(picked)).iterrows():
                 picked.append(row)
-                
         selected_samples.extend(picked)
 
-    return pd.DataFrame(selected_samples), df
+    return pd.DataFrame(selected_samples)
 
-# 运行
-try:
-    merged_df = load_data()
-    print(f">>> 成功对齐 {len(merged_df)} 条数据。")
-    
-    top_samples, full_ranked_df = rank_and_select(merged_df)
-    
-    # 保存结果
-    top_samples.to_csv("top_test_set_samples.csv", index=False)
-    full_ranked_df.to_csv("all_samples_ranked.csv", index=False)
-    
-    print(f"\n>>> 筛选完成！已选出 {len(top_samples)} 条优秀样本。")
-    print(f">>> 结果已保存至 top_test_set_samples.csv")
-    
-    # 打印每个文件夹选出的平均分
-    print("\n--- 每个文件夹筛选样本的平均逻辑得分 ---")
-    print(top_samples.groupby('folder')['logic'].mean())
+# 执行
+res_df = load_data()
+top_df = rank_and_select(res_df)
 
-except Exception as e:
-    print(f"Error: {e}")
-    import traceback
-    traceback.print_exc()
+# 只保留易读的列输出
+output_cols = ['folder', 'file_path', 'logic_raw', 'tool_raw', 'ifd_raw', 'miwv_raw', 'selectit_raw', 'tool_chain', 'final_score']
+top_df[output_cols].to_csv("top_test_set_final.csv", index=False)
+print("筛选完成！已保存至 top_test_set_final.csv")
